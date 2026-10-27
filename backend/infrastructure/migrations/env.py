@@ -1,0 +1,133 @@
+import asyncio
+import socket
+import time
+from logging.config import fileConfig
+from typing import Any
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+import functions.api.models  # noqa: F401
+import functions.evidence_collector.models  # noqa: F401
+import functions.orchestrator.evidence.models  # noqa: F401
+import functions.orchestrator.execution.models  # noqa: F401
+import functions.orchestrator.places.models  # noqa: F401
+from config.base_model import Base
+from config.config import settings
+
+_orig_getaddrinfo = socket.getaddrinfo
+_dns_cache: dict[tuple[Any, ...], Any] = {}
+
+
+def _resilient_getaddrinfo(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+    key = (host, port)
+    if key in _dns_cache:
+        return _dns_cache[key]
+    last_err: Exception | None = None
+    for _ in range(5):
+        try:
+            res = _orig_getaddrinfo(host, port, *args, **kwargs)
+            _dns_cache[key] = res
+            return res
+        except socket.gaierror as e:
+            last_err = e
+            time.sleep(0.3)
+    if key in _dns_cache:
+        return _dns_cache[key]
+    if last_err:
+        raise last_err
+    raise socket.gaierror(-5, "No address associated with hostname")
+
+
+socket.getaddrinfo = _resilient_getaddrinfo
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+
+    section = config.get_section(config.config_ini_section, {})
+    url = settings.DATABASE_URL
+    connect_args = {"command_timeout": 60, "timeout": 30}
+    if "sslmode=require" in url or "ssl=require" in url or "aivencloud.com" in url or settings.DB_SSL:
+        connect_args["ssl"] = "require"
+    if "sslmode=" in url:
+        import re
+        url = re.sub(r"[?&]sslmode=[^&]+", "", url)
+        if "?" not in url and "&" in url:
+            url = url.replace("&", "?", 1)
+    section["sqlalchemy.url"] = url
+    connectable = async_engine_from_config(
+        section,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+        connect_args=connect_args,
+    )
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+
+    asyncio.run(run_async_migrations())
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
